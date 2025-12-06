@@ -1,6 +1,7 @@
 import time
 import numpy as np
 import matplotlib.pyplot as plt
+import collections
 
 import torch
 import torch.nn as nn
@@ -12,20 +13,19 @@ import ale_py
 from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation
 from torch.utils.data import Dataset, DataLoader
 
-
-# ---------------- Env helper ----------------
+# ---------------- 1. Environment Helper ----------------
 
 def make_breakout_env(seed: int = 0):
     """
-    Create an ALE/Breakout-v5 environment with standard Atari preprocessing:
-    grayscale observations, 84x84 resolution, frame_skip=4, and 4-frame stacking.
+    Create an ALE/Breakout-v5 environment with standard Atari preprocessing.
     """
-    gym.register_envs(ale_py)
+    if "ALE/Breakout-v5" not in gym.registry:
+        gym.register_envs(ale_py)
 
     env = gym.make(
         "ALE/Breakout-v5",
         render_mode="rgb_array",
-        frameskip=1,                 # frame_skip is handled by AtariPreprocessing
+        frameskip=1,                 # Handled by AtariPreprocessing
         repeat_action_probability=0,
     )
 
@@ -36,7 +36,7 @@ def make_breakout_env(seed: int = 0):
         screen_size=84,
         grayscale_obs=True,
         grayscale_newaxis=False,
-        scale_obs=False,             # still 0–255; later divided by 255 in the encoder
+        scale_obs=False,             # Keep as uint8 (0-255) to save memory
     )
 
     env = FrameStackObservation(
@@ -49,14 +49,11 @@ def make_breakout_env(seed: int = 0):
     return env
 
 
-# ------------- 1) CNN state encoder -------------
+# ---------------- 2. Model Architecture ----------------
 
 class CNNStateEncoder(nn.Module):
     """
-    Encode stacked Atari frames.
-
-    Input:  (B*K, 4, 84, 84)
-    Output: (B*K, d_model)
+    Encodes 4-stacked Atari frames into a vector.
     """
     def __init__(self, in_channels: int = 4, d_model: int = 256):
         super().__init__()
@@ -71,57 +68,18 @@ class CNNStateEncoder(nn.Module):
         self.fc = nn.Linear(64 * 7 * 7, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.float() / 255.0          # (B*K, 4, 84, 84)
+        # Normalization happens here on the fly
+        x = x.float() / 255.0  
         x = self.conv(x)
         x = x.view(x.size(0), -1)
         x = self.fc(x)
         return x
 
 
-# ------------- 2) Causal Transformer -------------
-
-class CausalTransformer(nn.Module):
-    def __init__(self, d_model: int = 256, n_layers: int = 4,
-                 n_heads: int = 4, dropout: float = 0.1):
-        super().__init__()
-        layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=4 * d_model,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
-        key_padding_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.encoder(x, mask=attn_mask, src_key_padding_mask=key_padding_mask)
-
-
-def build_causal_mask(L: int, device: torch.device) -> torch.Tensor:
-    """
-    Upper-triangular mask for causal attention.
-
-    True  = block future position,
-    False = allow attention.
-    """
-    return torch.triu(torch.ones(L, L, device=device), diagonal=1).bool()
-
-
-# ------------- 3) Decision Transformer (discrete) -------------
-
 class DecisionTransformerDiscrete(nn.Module):
     """
-    Decision Transformer for discrete action spaces.
-
-    Each time step is represented by three tokens:
-        [rtg_t, state_t, action_{t-1}]
-
-    The model predicts action_t at the action token positions.
+    Decision Transformer for Discrete Actions (Atari).
+    Sequence: [Return, State, Action]
     """
     def __init__(
         self,
@@ -131,45 +89,41 @@ class DecisionTransformerDiscrete(nn.Module):
         n_layers: int = 4,
         n_heads: int = 4,
         dropout: float = 0.1,
-        rtg_scale: float = 1000.0,
-        pixel_inputs: bool = True,
+        rtg_scale: float = 100.0,
         in_channels: int = 4,
     ):
         super().__init__()
         self.num_actions = num_actions
         self.d_model = d_model
-        self.pixel_inputs = pixel_inputs
         self.rtg_scale = rtg_scale
 
-        if pixel_inputs:
-            self.state_encoder = CNNStateEncoder(in_channels=in_channels, d_model=d_model)
-        else:
-            # use a linear projection for vector observations
-            self.state_proj = nn.Linear(in_channels, d_model)
-
-        # +1 for the START token used at a_{-1}
+        # 1. Embeddings
+        self.state_encoder = CNNStateEncoder(in_channels=in_channels, d_model=d_model)
+        
+        # Action embedding: num_actions + 1 (for the START token -1)
         self.embed_action = nn.Embedding(num_actions + 1, d_model)
         self.embed_rtg = nn.Linear(1, d_model)
         self.embed_time = nn.Embedding(max_timestep, d_model)
-        # token type: 0 = rtg, 1 = state, 2 = action
+        
+        # Token type embeddings (RTG=0, State=1, Action=2)
         self.embed_tokentype = nn.Embedding(3, d_model)
 
-        self.transformer = CausalTransformer(
-            d_model=d_model, n_layers=n_layers, n_heads=n_heads, dropout=dropout
+        # 2. Transformer
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=4 * d_model,
+                dropout=dropout,
+                batch_first=True,
+                norm_first=True, # Pre-norm is generally more stable
+            ),
+            num_layers=n_layers,
         )
+
+        # 3. Prediction Head
         self.action_head = nn.Linear(d_model, num_actions)
         self.layer_norm = nn.LayerNorm(d_model)
-
-    def _interleave(
-        self,
-        rtg_emb: torch.Tensor,
-        state_emb: torch.Tensor,
-        action_emb: torch.Tensor,
-    ) -> torch.Tensor:
-        B, K, D = rtg_emb.shape
-        seq = torch.stack([rtg_emb, state_emb, action_emb], dim=2)  # (B, K, 3, D)
-        seq = seq.view(B, 3 * K, D)
-        return seq
 
     def forward(
         self,
@@ -179,401 +133,384 @@ class DecisionTransformerDiscrete(nn.Module):
         timesteps: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Args:
-            rtg:       (B, K, 1)
-            states:    (B, K, 4, 84, 84)
-            actions:   (B, K), previous actions a_{t-1}, with -1 at t=0 (START)
-            timesteps: (B, K)
-            attention_mask: (B, 3K) bool, True for valid tokens
-
-        Returns:
-            logits: (B, K, num_actions)
-        """
+        
         B, K = actions.shape
         device = actions.device
 
-        t_embed = self.embed_time(timesteps)           # (B, K, D)
+        # --- Embeddings ---
+        t_embed = self.embed_time(timesteps)
 
-        # 1) RTG tokens
-        rtg_in = rtg / self.rtg_scale
-        rtg_emb = (
-            self.embed_rtg(rtg_in)
-            + t_embed
-            + self.embed_tokentype(torch.zeros_like(actions))  # token type 0
-        )
+        # A. RTG
+        rtg_emb = self.embed_rtg(rtg / self.rtg_scale) + t_embed + self.embed_tokentype(torch.zeros_like(actions))
 
-        # 2) State tokens
-        if self.pixel_inputs:
-            s = states.view(B * K, *states.shape[2:])  # (B*K, 4, 84, 84)
-            s_emb = self.state_encoder(s).view(B, K, self.d_model)
-        else:
-            s_emb = self.state_proj(states)
-        s_emb = (
-            s_emb
-            + t_embed
-            + self.embed_tokentype(torch.ones_like(actions))   # token type 1
-        )
+        # B. State (Combine Batch and Time dims for CNN)
+        s_flat = states.view(B * K, *states.shape[2:]) 
+        s_emb = self.state_encoder(s_flat).view(B, K, self.d_model)
+        s_emb = s_emb + t_embed + self.embed_tokentype(torch.ones_like(actions))
 
-        # 3) Action tokens
+        # C. Action (Handle -1 for start token)
         a_ids = actions.clone()
-        a_ids = torch.where(
-            a_ids < 0,
-            torch.full_like(a_ids, self.num_actions),
-            a_ids,
-        )
-        a_emb = (
-            self.embed_action(a_ids)
-            + t_embed
-            + self.embed_tokentype(torch.full_like(actions, 2))  # token type 2
-        )
+        a_ids[a_ids < 0] = self.num_actions # Map -1 to the last embedding index
+        a_emb = self.embed_action(a_ids) + t_embed + self.embed_tokentype(torch.full_like(actions, 2))
 
-        x = self._interleave(rtg_emb, s_emb, a_emb)    # (B, 3K, D)
+        # --- Interleave [R, s, a] ---
+        # Stack: (B, K, 3, D) -> View: (B, 3*K, D)
+        x = torch.stack([rtg_emb, s_emb, a_emb], dim=2).view(B, 3 * K, self.d_model)
         x = self.layer_norm(x)
 
-        L = x.size(1)
-        causal_mask = build_causal_mask(L, device)
+        # --- Causal Masking ---
+        # We need a mask size of 3*K
+        L = 3 * K
+        causal_mask = torch.triu(torch.ones(L, L, device=device), diagonal=1).bool()
 
+        # Handle padding mask (if provided)
         key_padding_mask = None
         if attention_mask is not None:
-            # attention_mask: True = keep; key_padding_mask: True = pad
-            key_padding_mask = ~attention_mask
+            # [CRITICAL FIX] Expand mask from (B, K) to (B, 3*K)
+            # attention_mask: True = Valid, False = Pad
+            # 1. Expand last dim: (B, K) -> (B, K, 3)
+            # 2. Reshape: (B, K, 3) -> (B, 3*K)
+            expanded_mask = attention_mask.unsqueeze(-1).expand(B, K, 3).reshape(B, 3 * K)
+            
+            # PyTorch transformer expects: True = Pad (Ignore), False = Keep
+            # So we invert our mask (where we used True for Valid)
+            key_padding_mask = ~expanded_mask
 
-        out = self.transformer(
-            x,
-            attn_mask=causal_mask,
-            key_padding_mask=key_padding_mask,
-        )
+        # --- Transformer Pass ---
+        out = self.transformer(x, mask=causal_mask, src_key_padding_mask=key_padding_mask)
 
-        # action token positions: 2, 5, 8, ... = 3*i + 2
-        idx = torch.arange(K, device=device) * 3 + 2
-        idx = idx.unsqueeze(0).expand(B, -1)  # (B, K)
-        a_hidden = out.gather(
-            dim=1,
-            index=idx.unsqueeze(-1).expand(B, K, self.d_model),
-        )
-
-        logits = self.action_head(a_hidden)            # (B, K, num_actions)
+        # --- Prediction ---
+        # We predict action given state. State tokens are at indices 1, 4, 7...
+        idx = torch.arange(K, device=device) * 3 + 1
+        idx = idx.unsqueeze(0).unsqueeze(-1).expand(B, K, self.d_model)
+        
+        s_hidden = out.gather(dim=1, index=idx)
+        logits = self.action_head(s_hidden) # (B, K, num_actions)
+        
         return logits
 
 
-# ------------- 4) Loss / RTG utils -------------
+# ---------------- 3. Expert Data Collection (RAM Hacking) ----------------
 
-def step_mask_to_token_mask(step_mask: torch.Tensor) -> torch.Tensor:
+def get_expert_action(env):
     """
-    Expand per-step mask (B, K) to per-token mask (B, 3K).
+    Reads Atari RAM to locate the paddle and ball, returning the optimal action.
     """
-    B, K = step_mask.shape
-    return step_mask.unsqueeze(-1).expand(B, K, 3).reshape(B, 3 * K)
+    # Breakout RAM: 72 = Paddle X, 99 = Ball X
+    try:
+        ram = env.unwrapped.ale.getRAM()
+        paddle_x = ram[72]
+        ball_x = ram[99]
+    except AttributeError:
+        # Fallback if ALE interface isn't accessible directly (rare)
+        return env.action_space.sample()
 
+    # Action 2 = Right, 3 = Left, 1 = Fire
+    if paddle_x < ball_x - 2:
+        return 2 
+    elif paddle_x > ball_x + 2:
+        return 3
+    else:
+        # If aligned, or ball not started, FIRE to start or wait
+        return 1 
 
-def compute_rtg(rewards, gamma: float = 1.0) -> torch.Tensor:
-    """
-    Compute return-to-go.
-
-    rewards: (T,)
-    returns: (T, 1) where rtg[t] = Σ_{t'≥t} gamma^{t'-t} * r[t']
-    """
-    if not torch.is_tensor(rewards):
-        rewards = torch.tensor(rewards, dtype=torch.float32)
-    T = rewards.shape[0]
-    rtg = torch.zeros(T, dtype=torch.float32)
-    running = 0.0
-    for t in reversed(range(T)):
-        running = float(rewards[t]) + gamma * running
-        rtg[t] = running
-    return rtg.unsqueeze(-1)
-
-
-def compute_dt_loss(model: nn.Module, batch: dict, ignore_index: int = -100):
-    """
-    Cross-entropy loss over action tokens, ignoring padded steps.
-    """
-    rtg        = batch["rtg"]          # (B, K, 1)
-    states     = batch["states"]       # (B, K, 4, 84, 84)
-    actions_in = batch["actions_in"]   # (B, K)
-    targets    = batch["actions_target"]
-    timesteps  = batch["timesteps"]    # (B, K)
-    step_mask  = batch["step_mask"]    # (B, K)
-
-    token_mask = step_mask_to_token_mask(step_mask)
-    logits = model(rtg, states, actions_in, timesteps, attention_mask=token_mask)
-
-    B, K, A = logits.shape
-    logits_flat = logits.reshape(B * K, A)
-    targets_flat = targets.reshape(B * K)
-
-    targets_masked = targets_flat.masked_fill(~step_mask.view(-1), ignore_index)
-    loss = F.cross_entropy(logits_flat, targets_masked, ignore_index=ignore_index)
-    return loss, logits
-
-
-# ------------- 5) Offline dataset for DT -------------
-
-def collect_random_trajectories(
-    env,
-    num_episodes: int = 20,
-    max_steps: int = 400,
-):
-    """
-    Collect a small offline dataset in Breakout using a random policy.
-
-    Returns:
-        trajectories: list of dicts with keys:
-            "states":  (T, 4, 84, 84) uint8
-            "actions": (T,) int64
-            "rewards": (T,) float32
-    """
+def collect_expert_trajectories(env, num_episodes=50, max_steps=10000):
     trajectories = []
+    print(f"Collecting {num_episodes} Expert Episodes...")
+    
+    total_frames = 0
+    scores = []
+
     for ep in range(num_episodes):
-        obs, info = env.reset()
-        obs = np.array(obs)   # (4, 84, 84)
+        obs, _ = env.reset()
+        obs = np.array(obs)
+        
+        states, actions, rewards = [], [], []
+        done = False
+        ep_return = 0
+        
+        for _ in range(max_steps):
+            # 95% Expert, 5% Random noise (to improve robustness)
+            if np.random.rand() < 0.95:
+                action = get_expert_action(env)
+            else:
+                action = env.action_space.sample()
 
-        states = []
-        actions = []
-        rewards = []
-
-        for t in range(max_steps):
-            action = env.action_space.sample()
-            next_obs, reward, terminated, truncated, info = env.step(action)
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
 
             states.append(obs)
             actions.append(action)
             rewards.append(reward)
-
+            
             obs = np.array(next_obs)
-
-            if terminated or truncated:
+            ep_return += reward
+            
+            if done:
                 break
+        
+        # Only save valid games
+        if len(actions) > 10:
+            trajectories.append({
+                "states": np.stack(states).astype(np.uint8),
+                "actions": np.array(actions, dtype=np.int64),
+                "rewards": np.array(rewards, dtype=np.float32),
+            })
+            total_frames += len(actions)
+            scores.append(ep_return)
+            print(f"  Ep {ep+1}: Return {ep_return:.0f}, Length {len(actions)}")
 
-        if len(actions) == 0:
-            continue
+    print(f"Collected {len(trajectories)} trajectories. Avg Score: {np.mean(scores):.2f}")
+    return trajectories, np.mean(scores)
 
-        traj = {
-            "states":  np.stack(states, axis=0).astype(np.uint8),
-            "actions": np.array(actions, dtype=np.int64),
-            "rewards": np.array(rewards, dtype=np.float32),
-        }
-        trajectories.append(traj)
-        print(f"Collected episode {ep + 1}/{num_episodes}, length={len(actions)}")
 
-    return trajectories
+# ---------------- 4. Dataset & Utils ----------------
 
+def compute_rtg(rewards, gamma=1.0):
+    T = len(rewards)
+    rtg = np.zeros(T, dtype=np.float32)
+    running_sum = 0
+    for t in reversed(range(T)):
+        running_sum = rewards[t] + gamma * running_sum
+        rtg[t] = running_sum
+    return rtg
 
 class DTTrajectoryDataset(Dataset):
-    """
-    Dataset that samples short windows of length K from a list of trajectories.
-    """
-    def __init__(self, trajectories, K: int, gamma: float = 1.0):
+    def __init__(self, trajectories, K=20, gamma=1.0):
         self.trajectories = trajectories
         self.K = K
         self.gamma = gamma
-        self.lengths = [len(traj["actions"]) for traj in trajectories]
+        self.indices = []
+        
+        # Index all possible start positions
+        for i, traj in enumerate(trajectories):
+            T = len(traj["actions"])
+            # We can start anywhere from 0 to T-1
+            for t in range(T):
+                self.indices.append((i, t))
 
     def __len__(self):
-        # Rough estimate; we randomly choose trajectories in __getitem__.
-        return sum(self.lengths)
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        traj = self.trajectories[np.random.randint(len(self.trajectories))]
+        traj_idx, start_t = self.indices[idx]
+        traj = self.trajectories[traj_idx]
         T = len(traj["actions"])
+        
+        end_t = min(start_t + self.K, T)
+        real_len = end_t - start_t
+        
+        # Extract slices
+        s = traj["states"][start_t:end_t]
+        a = traj["actions"][start_t:end_t]
+        r = traj["rewards"][start_t:end_t]
+        
+        # Compute RTG for this segment (simplified)
+        # Ideally we take the full episode RTG and slice it
+        full_rtg = compute_rtg(traj["rewards"][start_t:], gamma=self.gamma)
+        rtg_slice = full_rtg[:real_len]
 
-        start = np.random.randint(0, T)
-        end = min(T, start + self.K)
-        L = end - start
+        # Prepare padded buffers
+        s_pad = np.zeros((self.K, 4, 84, 84), dtype=np.uint8)
+        a_pad = -np.ones(self.K, dtype=np.int64) # -1 is padding
+        rtg_pad = np.zeros((self.K, 1), dtype=np.float32)
+        t_pad = np.zeros(self.K, dtype=np.int64)
+        mask_pad = np.zeros(self.K, dtype=bool) # False means padding
 
-        states  = traj["states"][start:end]      # (L, 4, 84, 84)
-        actions = traj["actions"][start:end]
-        rewards = traj["rewards"][start:end]
+        # Fill data
+        s_pad[:real_len] = s
+        # For actions input, we shift: a_input[t] = a[t-1]
+        # At start_t=0, the first input is dummy -1
+        a_pad[0] = -1
+        if real_len > 1:
+            a_pad[1:real_len] = a[:real_len-1]
+            
+        rtg_pad[:real_len, 0] = rtg_slice
+        t_pad[:real_len] = np.arange(start_t, end_t)
+        mask_pad[:real_len] = True
+        
+        # Targets are the actual actions
+        a_target = -100 * np.ones(self.K, dtype=np.int64) # -100 ignored by CE loss
+        a_target[:real_len] = a
 
-        rtg_full = compute_rtg(rewards, gamma=self.gamma)  # (L, 1)
-
-        K = self.K
-        states_padded = np.zeros((K, 4, 84, 84), dtype=np.uint8)
-        actions_in    = -np.ones((K,), dtype=np.int64)   # a_{t-1}
-        actions_tgt   = -np.ones((K,), dtype=np.int64)
-        rtg_padded    = np.zeros((K, 1), dtype=np.float32)
-        timesteps     = np.zeros((K,), dtype=np.int64)
-        step_mask     = np.zeros((K,), dtype=bool)
-
-        states_padded[:L] = states
-        actions_tgt[:L]   = actions
-        rtg_padded[:L]    = rtg_full.numpy()
-        timesteps[:L]     = np.arange(start, start + L)
-        step_mask[:L]     = True
-
-        if L > 0:
-            actions_in[1:L] = actions[:L - 1]
-
-        batch = {
-            "states":         torch.from_numpy(states_padded),
-            "actions_in":     torch.from_numpy(actions_in),
-            "actions_target": torch.from_numpy(actions_tgt),
-            "rtg":            torch.from_numpy(rtg_padded),
-            "timesteps":      torch.from_numpy(timesteps),
-            "step_mask":      torch.from_numpy(step_mask),
+        return {
+            "states": torch.from_numpy(s_pad),
+            "actions": torch.from_numpy(a_pad), # Input to model
+            "rtg": torch.from_numpy(rtg_pad),
+            "timesteps": torch.from_numpy(t_pad),
+            "mask": torch.from_numpy(mask_pad),
+            "targets": torch.from_numpy(a_target) # Ground truth
         }
-        return batch
 
 
-# ------------- 6) Evaluation -------------
+# ---------------- 5. Evaluation Loop ----------------
 
 @torch.no_grad()
-def evaluate_dt_discrete(env, model, K: int = 20, target_return: float = 50.0):
-    """
-    Run a single online rollout in Breakout using the Decision Transformer.
-    Returns the episode return.
-    """
+def evaluate_agent(env, model, device, rtg_target, K=20):
     model.eval()
-    device = next(model.parameters()).device
-
-    obs, info = env.reset()
-    obs = np.array(obs)          # (4, 84, 84)
-    episode_return = 0.0
+    obs, _ = env.reset()
+    obs = np.array(obs) # (4, 84, 84)
+    
+    # Context buffers
+    states = collections.deque(maxlen=K)
+    actions = collections.deque(maxlen=K)
+    rtgs = collections.deque(maxlen=K)
+    timesteps = collections.deque(maxlen=K)
+    
+    # Initial state
+    states.append(obs)
+    actions.append(-1) # Start token
+    rtgs.append(rtg_target)
+    timesteps.append(0)
+    
+    ep_return = 0
     done = False
-    t = 0
-
-    states_seq = []
-    actions_seq = []
-    rtg_seq = []
-    t_seq = []
-    running_rtg = target_return
-
+    cur_step = 0
+    
     while not done:
-        states_seq.append(obs)
-        rtg_seq.append([running_rtg])
-        t_seq.append(t)
-        if len(actions_seq) == 0:
-            actions_seq.append(-1)
-        else:
-            actions_seq.append(actions_seq[-1])
-
-        s_np = np.array(states_seq[-K:], dtype=np.uint8)
-        a_np = np.array(actions_seq[-K:], dtype=np.int64)
-        rtg_np = np.array(rtg_seq[-K:], dtype=np.float32)
-        t_np = np.array(t_seq[-K:], dtype=np.int64)
-
-        L = s_np.shape[0]
-        states = np.zeros((K, 4, 84, 84), dtype=np.uint8)
-        actions_in = -np.ones((K,), dtype=np.int64)
-        rtg = np.zeros((K, 1), dtype=np.float32)
-        timesteps = np.zeros((K,), dtype=np.int64)
-
-        states[:L] = s_np
-        rtg[:L] = rtg_np
-        timesteps[:L] = t_np
-        if L > 0:
-            actions_in[1:L] = a_np[:L - 1]
-            actions_in[0] = -1
-
-        states_t = torch.from_numpy(states).unsqueeze(0).to(device)
-        rtg_t = torch.from_numpy(rtg).unsqueeze(0).to(device)
-        a_in_t = torch.from_numpy(actions_in).unsqueeze(0).to(device)
-        ts_t = torch.from_numpy(timesteps).unsqueeze(0).to(device)
-
-        logits = model(rtg_t, states_t, a_in_t, ts_t)     # (1, K, A)
-        action = int(torch.argmax(logits[0, L - 1]).item())
-
-        next_obs, reward, terminated, truncated, info = env.step(action)
+        # Prepare batch
+        # Convert deques to tensors
+        # Pad if length < K
+        cur_len = len(states)
+        
+        s_tensor = torch.zeros((1, K, 4, 84, 84), dtype=torch.uint8, device=device)
+        a_tensor = -torch.ones((1, K), dtype=torch.long, device=device)
+        r_tensor = torch.zeros((1, K, 1), dtype=torch.float32, device=device)
+        t_tensor = torch.zeros((1, K), dtype=torch.long, device=device)
+        mask = torch.zeros((1, K), dtype=torch.bool, device=device)
+        
+        # Fill from right (standard for transformers usually) or left? 
+        # DT usually fills normally 0..L.
+        s_np = np.array(states)
+        s_tensor[0, :cur_len] = torch.from_numpy(s_np)
+        
+        a_np = np.array(actions)
+        a_tensor[0, :cur_len] = torch.from_numpy(a_np)
+        
+        r_np = np.array(rtgs)
+        r_tensor[0, :cur_len, 0] = torch.from_numpy(r_np)
+        
+        t_np = np.array(timesteps)
+        t_tensor[0, :cur_len] = torch.from_numpy(t_np)
+        
+        mask[0, :cur_len] = True
+        
+        # Predict
+        logits = model(r_tensor, s_tensor, a_tensor, t_tensor, attention_mask=mask)
+        
+        # Get action from the last valid position
+        last_logits = logits[0, cur_len-1]
+        action = torch.argmax(last_logits).item()
+        
+        # Step env
+        next_obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
-        episode_return += reward
-        running_rtg -= reward
+        ep_return += reward
+        
+        # Update context
+        cur_step += 1
+        states.append(np.array(next_obs))
+        actions.append(action)
+        # Decrement RTG
+        current_rtg = rtgs[-1] - reward
+        rtgs.append(current_rtg)
+        timesteps.append(cur_step)
+        
+        if cur_step > 2000: break # Safety break
+        
+    return ep_return
 
-        obs = np.array(next_obs)
-        actions_seq[-1] = action
-        t += 1
 
-    return episode_return
-
-
-# ------------- 7) Main train & plot -------------
+# ---------------- 6. MAIN ----------------
 
 def main():
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
-    )
-    print("Device:", device)
+    # Setup Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    train_env = make_breakout_env(seed=0)
-    num_actions = train_env.action_space.n
-    print(
-        "Breakout actions:", num_actions,
-        train_env.unwrapped.get_action_meanings(),
-    )
-
-    # 1) Collect offline data
-    trajectories = collect_random_trajectories(
-        train_env,
-        num_episodes=20,
-        max_steps=400,
-    )
-    print("Total trajectories:", len(trajectories))
-
+    # 1. Environment & Expert Data
+    env = make_breakout_env()
+    expert_trajs, expert_mean = collect_expert_trajectories(env, num_episodes=20)
+    
+    # 2. Dataset
     K = 20
-    d_model = 256
-    rtg_scale = 100.0
-
+    dataset = DTTrajectoryDataset(expert_trajs, K=K)
+    loader = DataLoader(dataset, batch_size=32, shuffle=True, drop_last=True)
+    
+    # 3. Model
+    # Note: rtg_scale helps normalize the RTG inputs. 
+    # Expert score is high, so we scale it down.
     model = DecisionTransformerDiscrete(
-        num_actions=num_actions,
-        d_model=d_model,
-        rtg_scale=rtg_scale,
+        num_actions=env.action_space.n,
+        rtg_scale=10.0, 
     ).to(device)
-
-    dataset = DTTrajectoryDataset(trajectories, K=K, gamma=1.0)
-    loader = DataLoader(
-        dataset,
-        batch_size=32,
-        shuffle=True,
-        drop_last=True,
-    )
-
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.1)
-
-    # 2) Training loop
+    
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    
+    # 4. Training Loop
+    updates = 0
+    max_updates = 2000
+    
+    print("Starting Training...")
     model.train()
-    max_updates = 1000
-    step = 0
     start_time = time.time()
-
-    while step < max_updates:
+    
+    losses = []
+    
+    while updates < max_updates:
         for batch in loader:
-            for k in batch:
-                batch[k] = batch[k].to(device)
-            loss, _ = compute_dt_loss(model, batch)
             optimizer.zero_grad()
+            
+            rtg = batch['rtg'].to(device)
+            states = batch['states'].to(device)
+            actions = batch['actions'].to(device)
+            timesteps = batch['timesteps'].to(device)
+            mask = batch['mask'].to(device)
+            targets = batch['targets'].to(device)
+            
+            # Step mask to token mask expansion is handled internally or implicitly by padding mask
+            # Here we just pass the padding mask (True = valid, False = pad)
+            # The model expects True = pad for src_key_padding_mask if inverted, 
+            # let's check logic inside model: key_padding_mask = ~attention_mask
+            # So passing standard mask (True=Valid) works.
+            
+            logits = model(rtg, states, actions, timesteps, attention_mask=mask)
+            
+            # Calculate Loss (Ignore padding -100)
+            # Logits: (B, K, A) -> (B*K, A)
+            logits = logits.reshape(-1, env.action_space.n)
+            targets = targets.reshape(-1)
+            
+            loss = F.cross_entropy(logits, targets, ignore_index=-100)
+            
             loss.backward()
             optimizer.step()
-
-            if step % 50 == 0:
-                print(f"Update {step}/{max_updates} | loss={loss.item():.4f}")
-            step += 1
-            if step >= max_updates:
+            
+            losses.append(loss.item())
+            updates += 1
+            
+            if updates % 100 == 0:
+                print(f"Step {updates}: Loss {loss.item():.4f}")
+            
+            if updates >= max_updates:
                 break
 
-    print(f"Training finished in {time.time() - start_time:.2f}s")
-
-    # 3) Evaluation and plot
-    eval_env = make_breakout_env(seed=123)
-    num_eval_eps = 50
-    returns = []
-    for ep in range(num_eval_eps):
-        R = evaluate_dt_discrete(eval_env, model, K=K, target_return=50.0)
-        returns.append(R)
-        print(f"[DT Breakout] Eval episode {ep + 1}/{num_eval_eps}: return={R}")
-
-    plt.figure(figsize=(6, 5))
-    plt.plot(returns)
-    plt.xlabel("Episode")
-    plt.ylabel("Return")
-    plt.title("Decision Transformer on Breakout")
-    plt.grid(True)
-    plt.tight_layout()
+    print(f"Training finished in {time.time()-start_time:.1f}s")
+    
+    # 5. Final Evaluation
+    print("\nRunning Evaluation...")
+    eval_scores = []
+    for i in range(5):
+        # Prompt with slightly higher than expert mean to encourage best play
+        target = expert_mean * 1.1 
+        score = evaluate_agent(env, model, device, rtg_target=target, K=K)
+        eval_scores.append(score)
+        print(f"Eval Ep {i+1}: Score {score:.0f} (Target {target:.0f})")
+        
+    plt.plot(losses)
+    plt.title("Training Loss")
+    plt.xlabel("Updates")
     plt.show()
-
 
 if __name__ == "__main__":
     main()
